@@ -1,14 +1,14 @@
 import json
-import logging
 import os
+
+from datetime import datetime
 from typing import Any, List
 
 import httpx
 
 from app.exceptions import AccessBlockedException, RateLimitException
+from app.logging import app_logger
 
-
-app_logger = logging.getLogger('app')
 
 class GitHubAPI:
     def __init__(self):
@@ -44,54 +44,35 @@ class GitHubAPI:
         
         except Exception as ex:
             app_logger.error("RequestError", exc_info=True)
-    
-    def _filter_repo_detail(self, repo_detail: dict) -> dict:
-        #Leaving just needed fields
-        result = {
-            'repo': repo_detail['name'],
-            'owner': repo_detail['owner']['login'],
-            'position_cur': 0,
-            'position_prev': 0,
-            'stars': repo_detail['stargazers_count'],
-            'watchers': repo_detail['watchers_count'],
-            'forks': repo_detail['forks'],
-            'open_issues': repo_detail['open_issues'],
-            'language': repo_detail['language'] if repo_detail['language'] else "NULL",
-        }
-        return result
 
-    async def repos_list(self) -> List[dict]:
+    async def repos_list(self, since: int) -> List[dict]:
         #Receive repos list from GitHub
         app_logger.info("Getting list of repositories")
         
-        try:
-            url = f"https://api.github.com/repositories?since={self.since}"
-            response = await self._get_request(url=url)
-        except RateLimitException:
-            return []
-
-        #If no more repositories
-        #starting from the begining
-        repos_list = json.loads(response.content)
-        if len(repos_list) == 0:
-            self.since = 1
+        url = f"https://api.github.com/repositories?since={since}"
+        response = await self._get_request(url=url)
+        repos_list = response.json()
+        return repos_list
+    
+    async def repo_detail(self, repo: dict) -> dict:
+        app_logger.info(f"Getting {repo['owner']['login']}/{repo['name']} detail")
         
-        #GitHub API does not provide detail repository info
-        #Checking it manually for each one and preparing a new list
-        #And filtering important info
-        formatted_list = []
-        for repo in repos_list:
-            try:
-                detail_url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}"
-                detail_response = await self._get_request(url=detail_url)
-            except RateLimitException:
-                break
-            except AccessBlockedException:
-                continue
+        detail_url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}"
+        detail_response = await self._get_request(url=detail_url)
+        repo_detail = detail_response.json()
+        return repo_detail
 
-            repo_detail = json.loads(detail_response.content)
-            repo_dict = self._filter_repo_detail(repo_detail)
-            formatted_list.append(repo_dict)
-            self.since = repo_detail['id']
+    async def repo_activities(self, repo: dict) -> dict:
+        activities_list = []
+        check_activities = True
+        while check_activities:
+            url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}/activity?per_page=100"
+            response = await self._get_request(url=url)
+            activities = response.json()
+            
+            activities_list += activities
+            check_activities = len(activities) == 100
 
-        return formatted_list
+        return activities_list
+
+github = GitHubAPI()    

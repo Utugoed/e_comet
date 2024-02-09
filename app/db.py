@@ -1,19 +1,18 @@
-import logging
 import os
 from typing import Any, List
 
 import asyncpg
 
-
-app_logger = logging.getLogger('app')
+from app.logging import app_logger
 
 
 class Database:
     def __init__(self):
         self.conn_string = os.getenv("CONNECTION_STRING")
         self.top_table = 'top_100'
+        self.activity_table = 'activity'
         
-    async def get_connection(self) -> asyncpg.Connection:
+    async def _get_connection(self) -> asyncpg.Connection:
         app_logger.info("Connecting to Database")
         conn = await asyncpg.connect(self.conn_string)
         app_logger.info("Database was connected successfully")
@@ -22,7 +21,7 @@ class Database:
     async def _db_query(self, method: callable, query: str) -> Any:
         #Internal method for applying to the database 
         #and ensuring the connection is closed
-        conn = await self.get_connection()
+        conn = await self._get_connection()
         try:
             data = await getattr(conn, method)(query)
             return data
@@ -40,6 +39,7 @@ class Database:
                 SELECT *
                 FROM top_100
                 ORDER BY stars DESC
+                LIMIT 100
             """
         )
         dicted_data = [dict(row) for row in data]
@@ -53,8 +53,6 @@ class Database:
         for i, repo in enumerate(sorted_list, start=1):
             repo['position_cur'] = i
             repo['position_prev'] = i + 1
-        
-        last_in_top = sorted_list[99]
 
         #Preparing values tuples
         values_list = []
@@ -73,8 +71,57 @@ class Database:
                     open_issues=EXCLUDED.open_issues,
                     "language"=EXCLUDED."language";
                 
+                DO
+                $$
+                DECLARE
+                    repos_cursor CURSOR FOR 
+                        SELECT repo, "owner", stars
+                        FROM {self.top_table}
+                        ORDER BY stars DESC;
+                    repo_record RECORD;
+                    counter INTEGER;
+                BEGIN
+                    counter := 1;
+                    OPEN repos_cursor;
+                    LOOP
+                        FETCH NEXT FROM repos_cursor INTO repo_record;
+                        EXIT WHEN NOT FOUND;
+                        EXECUTE 'UPDATE {self.top_table} 
+                            SET position_cur = $1, position_prev = $2
+                            WHERE repo = $3 AND "owner" = $4'
+                        USING counter, counter + 1, repo_record.repo, repo_record."owner";
+                        counter := counter + 1;
+                    END LOOP;
+                    CLOSE repos_cursor;
+                END;
+                $$
+                LANGUAGE PLPGSQL;
+
                 DELETE FROM {self.top_table}
                 WHERE position_cur > 100;
             COMMIT;
         """
         await self._db_query('execute', query)
+    
+    async def update_activity(self, activity_list: List[dict]) -> None:
+        app_logger.info("Updating activity")
+
+        values_list = []
+        for activity in activity_list:
+            values_list.append(
+                f"('{activity['repo']}', '{activity['owner']}', \
+                    '{activity['date']}', {activity['commits']}, {activity['authors']})"
+            )
+        
+        query = f"""
+            INSERT INTO {self.activity_table}
+            VALUES {','.join([values for values in values_list])}
+            ON CONFLICT ("repo", "owner", "date") DO UPDATE SET
+                commits = EXCLUDED.commits,
+                authors = EXCLUDED.authors;
+        """
+        app_logger.info(f"{query=}")
+        await self._db_query('execute', query)
+
+
+db = Database()

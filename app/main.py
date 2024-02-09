@@ -1,63 +1,115 @@
 import bisect
-import json
-import logging
 import os
 
-from typing import Any, List, Union
-
-import httpx
-import ssl
+from datetime import date
+from typing import List, Union
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from app.db import Database
+from app.exceptions import AccessBlockedException, RateLimitException
+from app.logging import app_logger
 from app.parser import GitHubAPI
 from app.schemas import Activity, Repository
 
 
 load_dotenv(".env")
 
-app_logger = logging.getLogger("app")
-app_logger.setLevel(logging.INFO)
-
-log_handler = logging.StreamHandler()
-log_formatter = logging.Formatter("%(name)s - %(asctime)s - %(levelname)s: %(message)s")
-
-log_handler.setFormatter(log_formatter)
-app_logger.addHandler(log_handler)
-
-
 app = FastAPI()
 github = GitHubAPI()
 db = Database()
 
+def filter_repo_detail(repo_detail: dict) -> dict:
+    #Leaving just needed fields
+    result = {
+        'repo': repo_detail['name'],
+        'owner': repo_detail['owner']['login'],
+        'position_cur': 0,
+        'position_prev': 0,
+        'stars': repo_detail['stargazers_count'],
+        'watchers': repo_detail['watchers_count'],
+        'forks': repo_detail['forks'],
+        'open_issues': repo_detail['open_issues'],
+        'language': repo_detail['language'] if repo_detail['language'] else "NULL",
+    }
+    return result
+
+def group_activities(activities: List[dict], repo_name: str, owner: str) -> List[dict]:
+    groupped_dict = {}
+    for activity in activities:
+        activity_date = activity['timestamp'][:10]
+        date_activities = groupped_dict.get(
+            activity_date,
+            {
+                'commits': 0,
+                'authors': set(),
+                'repo': repo_name,
+                'owner': owner
+            }
+        )
+        date_activities['commits'] += 1
+        date_activities['authors'].add(activity['actor']['login'])
+        groupped_dict[activity_date] = date_activities
+    
+    groupped_list = [
+        {
+            'repo': groupped_dict[activity_date]['repo'],
+            'owner': groupped_dict[activity_date]['owner'],
+            'date': activity_date,
+            'commits': groupped_dict[activity_date]['commits'],
+            'authors': f"ARRAY {list(groupped_dict[activity_date]['authors'])}"
+        }
+        for activity_date in groupped_dict.keys()
+    ]
+    return groupped_list
+
 @app.get("/")#, response_model=List[Repository])
 async def read_root():
-    repos_list = await github.repos_list()
-    top_100 = await db.get_repos()
-    new_top = top_100.copy()
+    since = int(os.environ.get("GITHUB_REPOSITORIES_SINCE"))
+    try:
+        repos_list = await github.repos_list(since)
+    except RateLimitException:
+        return []
     
-    #Inserting new repositories to top
-    #While maintaining order
-    for new_repo in repos_list:
-        #Check if repository already in top
-        for repo in new_top:
-            if (repo['owner'] == new_repo['owner'] and repo['repo'] == new_repo['repo']):
-                new_top.remove(repo)
-                break
-        bisect.insort(new_top, new_repo, key=lambda x: -x['stars'])
+    #GitHub API does not provide detail repository info
+    #Checking it manually for each one
+    detailed_repos_list = []
+    for repo in repos_list:
+        try:
+            repo_detail = await github.repo_detail(repo)
+        except RateLimitException:
+            break
+        except AccessBlockedException:
+            continue
+        
+        try:
+            activities = await github.repo_activities(repo)
+        except RateLimitException:
+            break
+        app_logger.info(f"{activities=}")
+        if activities:
+            groupped_activities = group_activities(
+                activities=activities,
+                repo_name=repo['name'],
+                owner=repo['owner']['login']
+            )
+            app_logger.info(f"{groupped_activities=}")
+            app_logger.info(f"{','.join([str(v) for v in groupped_activities[0].values()])}")
+            await db.update_activity(groupped_activities)
 
-    for i, repo in enumerate(top_100, start=1):
-        repo['position_cur'], repo['position_prev'] = i, i+1
+        filtered_repo = filter_repo_detail(repo_detail)
+        detailed_repos_list.append(filtered_repo)
+        since = repo['id'] + 1
 
-    if top_100 == new_top[:100]:
-        return new_top
+    if detailed_repos_list:
+        await db.update_repos(detailed_repos_list)
+        os.environ['GITHUB_REPOSITORIES_SINCE'] = str(since)
     
-    await db.update_repos(top_100)
-    return top_100
+    return detailed_repos_list
 
 
-@app.get("/items/{item_id}", response_model=Activity)
+@app.get("/items/{item_id}")#, response_model=Activity)
 async def read_item(item_id: int, q: Union[str, None] = None):
-    return {"item_id": item_id, "q": q}
+    r = await github.repo_activities()
+    return r
