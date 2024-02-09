@@ -1,8 +1,23 @@
 from datetime import datetime
+from enum import Enum
 from typing import List
 
 from pydantic import BaseModel, Field
 
+
+class SortOrder(Enum):
+    desc = "desc"
+    asc = "asc"
+
+class RepositorySortField(Enum):
+    repo = "repo"
+    owner = "owner"
+    position = "position"
+    stars = "stars"
+    watchers = "watchers"
+    forks = "forks"
+    open_issues = "open_issues"
+    language = "language"
 
 class Repository(BaseModel):
     repo: str = Field(..., title="Repo's name", description="full_name in the GitHub API")

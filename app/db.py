@@ -1,16 +1,17 @@
-import os
+from datetime import date
 from typing import Any, List
 
 import asyncpg
 
+from app.config import Settings
 from app.logging import app_logger
 
 
 class Database:
     def __init__(self):
-        self.conn_string = os.getenv("CONNECTION_STRING")
-        self.top_table = 'top_100'
-        self.activity_table = 'activity'
+        self.conn_string = Settings().connection_string
+        self.top_table = Settings().top_table
+        self.activity_table = Settings().activity_table
         
     async def _get_connection(self) -> asyncpg.Connection:
         app_logger.info("Connecting to Database")
@@ -31,17 +32,24 @@ class Database:
             await conn.close()
             app_logger.info("Connection was closed")
 
-    async def get_repos(self) -> List[dict]:
+    async def get_repos_top(self, sort_by: str="stars", order: str="desc") -> List[dict]:
         app_logger.info("Getting top 100 repos from DB")
-        data = await self._db_query(
-            'fetch',
-            """
+        if sort_by == "position":
+            query = f"""
                 SELECT *
-                FROM top_100
-                ORDER BY stars DESC
+                FROM {self.top_table}
+                ORDER BY position_cur {order}
                 LIMIT 100
             """
-        )
+        else:
+            query = f"""
+                SELECT *
+                FROM {self.top_table}
+                ORDER BY {sort_by} {order}
+                LIMIT 100
+            """
+        
+        data = await self._db_query('fetch', query)
         dicted_data = [dict(row) for row in data]
         return dicted_data
     
@@ -103,9 +111,21 @@ class Database:
         """
         await self._db_query('execute', query)
     
+    async def get_activity(self, repo: str, owner: str, since: date, until: date) -> List[dict]:
+        app_logger.info(f"Getting activity of /{owner}/{repo} from {since} to {until}")
+        query = f"""
+            SELECT *
+            FROM {self.activity_table}
+            WHERE repo = '{repo}'
+                AND "owner" = '{owner}'
+                AND "date" BETWEEN '{since}' AND '{until}'
+        """
+        data = await self._db_query('fetch', query)
+        dicted_data = [dict(row) for row in data]
+        return dicted_data
+    
     async def update_activity(self, activity_list: List[dict]) -> None:
         app_logger.info("Updating activity")
-
         values_list = []
         for activity in activity_list:
             values_list.append(
@@ -120,7 +140,6 @@ class Database:
                 commits = EXCLUDED.commits,
                 authors = EXCLUDED.authors;
         """
-        app_logger.info(f"{query=}")
         await self._db_query('execute', query)
 
 

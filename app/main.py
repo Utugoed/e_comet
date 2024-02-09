@@ -1,115 +1,33 @@
-import bisect
-import os
-
 from datetime import date
-from typing import List, Union
+from typing import List, Optional
 
-from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from app.db import Database
-from app.exceptions import AccessBlockedException, RateLimitException
 from app.logging import app_logger
 from app.parser import GitHubAPI
-from app.schemas import Activity, Repository
+from app.schemas import Activity, Repository, RepositorySortField, SortOrder
 
-
-load_dotenv(".env")
 
 app = FastAPI()
 github = GitHubAPI()
 db = Database()
 
-def filter_repo_detail(repo_detail: dict) -> dict:
-    #Leaving just needed fields
-    result = {
-        'repo': repo_detail['name'],
-        'owner': repo_detail['owner']['login'],
-        'position_cur': 0,
-        'position_prev': 0,
-        'stars': repo_detail['stargazers_count'],
-        'watchers': repo_detail['watchers_count'],
-        'forks': repo_detail['forks'],
-        'open_issues': repo_detail['open_issues'],
-        'language': repo_detail['language'] if repo_detail['language'] else "NULL",
-    }
-    return result
 
-def group_activities(activities: List[dict], repo_name: str, owner: str) -> List[dict]:
-    groupped_dict = {}
-    for activity in activities:
-        activity_date = activity['timestamp'][:10]
-        date_activities = groupped_dict.get(
-            activity_date,
-            {
-                'commits': 0,
-                'authors': set(),
-                'repo': repo_name,
-                'owner': owner
-            }
-        )
-        date_activities['commits'] += 1
-        date_activities['authors'].add(activity['actor']['login'])
-        groupped_dict[activity_date] = date_activities
-    
-    groupped_list = [
-        {
-            'repo': groupped_dict[activity_date]['repo'],
-            'owner': groupped_dict[activity_date]['owner'],
-            'date': activity_date,
-            'commits': groupped_dict[activity_date]['commits'],
-            'authors': f"ARRAY {list(groupped_dict[activity_date]['authors'])}"
-        }
-        for activity_date in groupped_dict.keys()
-    ]
-    return groupped_list
+@app.get("/repos/top100", response_model=List[Repository])
+async def repositories_top(sort_by: Optional[RepositorySortField]=None, order: Optional[SortOrder]=None):
+    sort_by = sort_by if not sort_by else sort_by.value
+    order = order if not order else order.value
 
-@app.get("/")#, response_model=List[Repository])
-async def read_root():
-    since = int(os.environ.get("GITHUB_REPOSITORIES_SINCE"))
-    try:
-        repos_list = await github.repos_list(since)
-    except RateLimitException:
-        return []
-    
-    #GitHub API does not provide detail repository info
-    #Checking it manually for each one
-    detailed_repos_list = []
-    for repo in repos_list:
-        try:
-            repo_detail = await github.repo_detail(repo)
-        except RateLimitException:
-            break
-        except AccessBlockedException:
-            continue
-        
-        try:
-            activities = await github.repo_activities(repo)
-        except RateLimitException:
-            break
-        app_logger.info(f"{activities=}")
-        if activities:
-            groupped_activities = group_activities(
-                activities=activities,
-                repo_name=repo['name'],
-                owner=repo['owner']['login']
-            )
-            app_logger.info(f"{groupped_activities=}")
-            app_logger.info(f"{','.join([str(v) for v in groupped_activities[0].values()])}")
-            await db.update_activity(groupped_activities)
+    repos_list = await db.get_repos_top(sort_by, order)
+    return repos_list
 
-        filtered_repo = filter_repo_detail(repo_detail)
-        detailed_repos_list.append(filtered_repo)
-        since = repo['id'] + 1
-
-    if detailed_repos_list:
-        await db.update_repos(detailed_repos_list)
-        os.environ['GITHUB_REPOSITORIES_SINCE'] = str(since)
-    
-    return detailed_repos_list
-
-
-@app.get("/items/{item_id}")#, response_model=Activity)
-async def read_item(item_id: int, q: Union[str, None] = None):
-    r = await github.repo_activities()
-    return r
+@app.get("/repos/{owner}/{repo}/activity", response_model=List[Activity])
+async def read_item(
+    owner: str, repo: str, since: date=date(1980, 1, 1), until: date=date(3000, 1, 1)
+):
+    activity = await db.get_activity(
+        repo=repo, owner=owner, since=since, until=until
+    )
+    response_data = [Activity.parse_obj(el) for el in activity]
+    return response_data
